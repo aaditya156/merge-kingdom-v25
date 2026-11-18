@@ -10,7 +10,7 @@
 ## Executive Summary
 
 This document presents the technical analysis, systems architecture, and verified migration framework for transitioning **Merge Kingdom** from version 2.4 to 2.5.
-
+ 
 ### The Business Mandate & Economy Shift
 * **The Mandate:** *"No player may lose progress, or anything that they paid for."* (Assignment Brief, Page 2).
 * **The Economy Restructuring:**

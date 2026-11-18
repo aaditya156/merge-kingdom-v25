@@ -24,24 +24,20 @@ async def test_migration_pfp_policy_and_idempotency(db_session):
         token = login.json()["access_token"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # Setup: Manually insert legacy wallet balance (5400 coins) and purchase records (2000 purchased coins)
-        wallet = (await db_session.execute(
-            Wallet.__table__.select().where(Wallet.player_id == "p_8812")
-        )).first()
-        
+        # Setup: Set server wallet balance (5400 coins) and verified historical coin pack records (2000 purchased coins)
         await db_session.execute(
             Wallet.__table__.update()
             .where(Wallet.player_id == "p_8812")
             .values(coins_balance=5400, gems_balance=0)
         )
-        # 2 purchases of $9.99 (999 cents * 10 = ~2000 purchased coins)
+        # 2 purchases of documented historical coin packs (1,000 coins each)
         rec1 = PurchaseRecord(
             player_id="p_8812",
             store_platform="GOOGLE_PLAY",
             store_transaction_id="GPA.mig_sample_01",
-            product_id="gems_tier_2",
-            purchase_type="CURRENCY",
-            price_cents=100,  # 100 * 10 = 1000 coins
+            product_id="legacy_coin_pack_1000",
+            purchase_type="COIN_PACK",
+            price_cents=999,
             verification_status="VERIFIED",
             purchased_at=utc_now(),
         )
@@ -49,9 +45,9 @@ async def test_migration_pfp_policy_and_idempotency(db_session):
             player_id="p_8812",
             store_platform="GOOGLE_PLAY",
             store_transaction_id="GPA.mig_sample_02",
-            product_id="gems_tier_2",
-            purchase_type="CURRENCY",
-            price_cents=100,  # 100 * 10 = 1000 coins
+            product_id="legacy_coin_pack_1000",
+            purchase_type="COIN_PACK",
+            price_cents=999,
             verification_status="VERIFIED",
             purchased_at=utc_now(),
         )

@@ -1,6 +1,6 @@
-from typing import Annotated
+from typing import Annotated, Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.database import get_db
@@ -10,25 +10,50 @@ from backend.app.repositories.save_repo import SaveRepository
 from backend.app.models.entitlement import Entitlement
 from backend.app.models.wallet import Wallet
 from backend.app.models.migration import MigrationRecord
+from backend.app.models.purchase import PurchaseRecord
+from backend.app.models.device import DeviceRegistration
 from backend.app.models.base import utc_now
 
 router = APIRouter(prefix="/legacy", tags=["Legacy Compatibility (v2.0 - v2.4)"])
+
+NO_ADS_LEGACY_PRODUCTS = ["no_ads_bundle", "no_ads_standalone", "no_ads_legacy"]
 
 
 @router.post("/sync", response_model=LegacySaveResponse, status_code=status.HTTP_200_OK)
 async def legacy_sync(
     payload: LegacySaveRequest,
     session: Annotated[AsyncSession, Depends(get_db)],
+    x_device_id: Annotated[Optional[str], Header(alias="X-Device-Id")] = None,
 ):
     player_repo = PlayerRepository(session)
     save_repo = SaveRepository(session)
 
-    # 1. Ensure player exists
-    player = await player_repo.get_by_id(payload.player_id)
-    if not player:
-        player = await player_repo.create_player(payload.player_id)
+    # Priority 2 Fix: Authenticate / bind device to player_id
+    player = await player_repo.get_by_id(payload.player_id, load_devices=True)
 
-    # 2. Check entitlement (No Ads protection - solves Incident 3!)
+    if not player:
+        # Initial registration for this legacy player
+        player = await player_repo.create_player(payload.player_id)
+        if x_device_id:
+            await player_repo.register_device(
+                player_id=payload.player_id,
+                device_id=x_device_id,
+                platform="Android",
+                os_version="Legacy Client",
+                app_version="2.4",
+            )
+    else:
+        # Existing player: if player has registered devices, verify that requesting device is authorized
+        if player.devices:
+            registered_device_ids = {d.device_id for d in player.devices}
+            if x_device_id and x_device_id not in registered_device_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Unauthorized: Device is not bound to this player account.",
+                )
+
+    # Priority 2 Fix: Do NOT grant No Ads based merely on client payload.no_ads flag!
+    # Check if an authoritative active entitlement already exists on the server
     ent_query = await session.execute(
         select(Entitlement).where(
             Entitlement.player_id == payload.player_id,
@@ -38,24 +63,31 @@ async def legacy_sync(
     )
     ent = ent_query.scalar_one_or_none()
 
-    # If incoming payload has no_ads=True, make sure server records it
-    if payload.no_ads and not ent:
-        ent = Entitlement(
-            player_id=payload.player_id,
-            entitlement_key="no_ads",
-            is_active=True,
-            granted_by_source="LEGACY_SAVE_RESTORE",
-        )
-        session.add(ent)
-        await session.flush()
+    # If not on server, check for verified purchase evidence in purchase_records
+    if not ent:
+        purchase_evidence = (await session.execute(
+            select(PurchaseRecord).where(
+                PurchaseRecord.player_id == payload.player_id,
+                PurchaseRecord.verification_status.in_(["VERIFIED", "LEGACY"]),
+                PurchaseRecord.product_id.in_(NO_ADS_LEGACY_PRODUCTS),
+            )
+        )).first()
 
-    # Authoritative No Ads state: True if server entitlement exists, else incoming
-    authoritative_no_ads = True if ent and ent.is_active else payload.no_ads
+        if purchase_evidence:
+            ent = Entitlement(
+                player_id=payload.player_id,
+                entitlement_key="no_ads",
+                is_active=True,
+                granted_by_source="IAP_PURCHASE_RESTORE",
+            )
+            session.add(ent)
+            await session.flush()
+
+    # Authoritative state is derived purely from trusted server records
+    authoritative_no_ads = True if (ent and ent.is_active) else False
 
     # 3. Retrieve latest server save
     current_save = await save_repo.get_latest_save(payload.player_id)
-    
-    # Semantic merge: Level progress is monotonic
     resolved_level = payload.level
     merged_inventory = payload.inventory
     next_revision = 1
@@ -63,19 +95,16 @@ async def legacy_sync(
     if current_save:
         next_revision = current_save.revision_id + 1
         resolved_level = max(current_save.level, payload.level)
-        # Merge inventory
         merged_inventory = dict(current_save.inventory)
-        for item, count in payload.inventory.items():
-            merged_inventory[item] = max(merged_inventory.get(item, 0), count)
 
     # Save to server
-    saved = await save_repo.create_or_update_save(
+    await save_repo.create_or_update_save(
         player_id=payload.player_id,
         revision_id=next_revision,
         level=resolved_level,
         inventory=merged_inventory,
         game_state={},
-        device_id="legacy_client",
+        device_id=x_device_id or "legacy_client",
         client_saved_at=datetime.fromtimestamp(payload.saved_at, tz=timezone.utc),
     )
 
@@ -93,13 +122,10 @@ async def legacy_sync(
     )
     wallet = wallet_query.scalar_one_or_none()
 
-    # CRITICAL AUDIT FIX: If player already migrated, DO NOT re-inflate coins from v2.4!
-    # Doing so would allow double-spending (player keeps converted gems AND gets coins back).
-    # Only update coins if not migrated yet.
+    # Preserve migrated wallet balances against legacy uploads
     if wallet and not mig_record:
         wallet.coins_balance = max(wallet.coins_balance, payload.coins)
 
-    # Return standard v2.4 JSON structure with current server timestamp
     current_timestamp_seconds = int(utc_now().timestamp())
     return LegacySaveResponse(
         player_id=payload.player_id,

@@ -10,6 +10,9 @@ from backend.app.schemas.wallet import (
     TransactionResponse,
 )
 
+# Standard level completion reward cap
+MAX_LEVEL_COMPLETION_COINS = 100
+
 
 class WalletService:
     def __init__(self, session: AsyncSession):
@@ -46,8 +49,23 @@ class WalletService:
         request: EarnCoinsRequest,
         idempotency_key: Optional[str] = None,
     ) -> SpendResponse:
-        # Prevent level reward farming: Level rewards are idempotent per player per level
+        # Priority 4 Fix: Validate level completion reward amount
+        if request.coins_earned > MAX_LEVEL_COMPLETION_COINS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid reward amount: Level completion coins cannot exceed {MAX_LEVEL_COMPLETION_COINS}.",
+            )
+
+        # Priority 4 Fix: Level rewards are strictly idempotent per player per level
         effective_key = idempotency_key or f"level_reward_{player_id}_lvl_{request.level_completed}"
+
+        # Check if already claimed with a different reward amount
+        existing_tx = await self.wallet_repo.get_transaction_by_idempotency(effective_key)
+        if existing_tx and existing_tx.amount != request.coins_earned:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Level {request.level_completed} reward was already claimed with amount {existing_tx.amount}.",
+            )
 
         wallet, tx = await self.wallet_repo.mutate_balance(
             player_id=player_id,

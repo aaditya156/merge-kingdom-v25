@@ -263,6 +263,7 @@ async def test_06_old_clients_uploading_stale_saves(db_session):
 
         legacy_res = await client.post(
             "/api/v1/legacy/sync",
+            headers={"X-Device-Id": "new_phone"},
             json={
                 "player_id": "p_stale_legacy",
                 "saved_at": int((utc_now() + timedelta(days=5)).timestamp()),
@@ -302,6 +303,7 @@ async def test_07_old_clients_attempting_to_overwrite_gem_balances(db_session):
 
         await client.post(
             "/api/v1/legacy/sync",
+            headers={"X-Device-Id": "phone_25"},
             json={
                 "player_id": "p_gem_protector",
                 "saved_at": int(utc_now().timestamp()),

@@ -1,4 +1,5 @@
 from typing import Optional, List
+from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.purchase import PurchaseRecord
@@ -7,7 +8,7 @@ from backend.app.repositories.wallet_repo import WalletRepository
 from backend.app.schemas.purchase import VerifyPurchaseRequest, VerifyPurchaseResponse
 from backend.app.models.base import utc_now
 
-# In-Game Store Catalog Mapping
+# Verified In-Game Store Catalog Mapping (Strictly validated)
 PRODUCT_CATALOG = {
     "gems_tier_1": {"gems": 100, "price_cents": 99, "type": "CURRENCY", "entitlements": []},
     "gems_tier_2": {"gems": 500, "price_cents": 499, "type": "CURRENCY", "entitlements": []},
@@ -27,7 +28,16 @@ class PurchaseService:
         player_id: str,
         request: VerifyPurchaseRequest,
     ) -> VerifyPurchaseResponse:
-        # 1. Duplicate check (Idempotency on store_transaction_id)
+        # Priority 5 Fix: Reject unknown product IDs immediately
+        if request.product_id not in PRODUCT_CATALOG:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown product identifier '{request.product_id}'. Purchase rejected.",
+            )
+
+        product = PRODUCT_CATALOG[request.product_id]
+
+        # Priority 5 Fix: Duplicate check and ownership validation on store_transaction_id
         query = select(PurchaseRecord).where(
             PurchaseRecord.store_transaction_id == request.store_transaction_id
         )
@@ -37,7 +47,14 @@ class PurchaseService:
         wallet = await self.wallet_repo.get_wallet(player_id)
 
         if existing_record:
-            # Already processed, return idempotent response
+            # Ensure the store transaction ID belongs to THIS player and cannot be hijacked
+            if existing_record.player_id != player_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Transaction identifier is already registered to a different player account.",
+                )
+
+            # Already processed for this player, return idempotent response
             return VerifyPurchaseResponse(
                 verification_status=existing_record.verification_status,
                 store_transaction_id=existing_record.store_transaction_id,
@@ -49,15 +66,10 @@ class PurchaseService:
                 message="Transaction already processed and verified.",
             )
 
-        # 2. Lookup product in catalog
-        product = PRODUCT_CATALOG.get(
-            request.product_id,
-            {"gems": 100, "price_cents": 99, "type": "CURRENCY", "entitlements": []}
-        )
         gems_to_grant = product["gems"]
         entitlements_to_grant = product["entitlements"]
 
-        # 3. Create purchase record
+        # Create purchase record bound to player and store transaction
         purchase_rec = PurchaseRecord(
             player_id=player_id,
             store_platform=request.store_platform.upper(),
@@ -72,7 +84,7 @@ class PurchaseService:
         self.session.add(purchase_rec)
         await self.session.flush()
 
-        # 4. Grant Gems if applicable
+        # Grant Gems if applicable
         if gems_to_grant > 0:
             wallet, tx = await self.wallet_repo.mutate_balance(
                 player_id=player_id,
@@ -83,7 +95,7 @@ class PurchaseService:
                 idempotency_key=f"iap_{request.store_transaction_id}",
             )
 
-        # 5. Grant Entitlements if applicable
+        # Grant Entitlements if applicable
         for ent_key in entitlements_to_grant:
             ent_query = select(Entitlement).where(
                 Entitlement.player_id == player_id,

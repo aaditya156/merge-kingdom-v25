@@ -7,7 +7,7 @@ from backend.app.repositories.save_repo import SaveRepository
 from backend.app.schemas.save import SaveSyncRequest, SyncResultResponse, GameSaveResponse
 from backend.app.models.base import utc_now
 
-# Max legitimate level jump in a single offline sync batch
+# Prototype heuristic for progression bounds (Note: In production, requires move validation)
 MAX_ALLOWED_LEVEL_JUMP = 100
 
 
@@ -54,7 +54,7 @@ class SaveSyncService:
                 message="Initial save created.",
             )
 
-        # Progression Sanity Check: Prevent fraudulent level spoofing (e.g. jumping from level 1 to level 99999)
+        # Progression check: flags suspicious progression leaps
         if request.level > current_save.level + MAX_ALLOWED_LEVEL_JUMP:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -86,16 +86,31 @@ class SaveSyncService:
                     message="Save accepted cleanly.",
                 )
             except IntegrityError:
-                # Concurrent write collided at same revision, refresh and fall back to semantic merge
                 await self.session.rollback()
                 current_save = await self.save_repo.get_latest_save(player_id)
 
         # Case 3: Stale base revision or concurrency collision -> SEMANTIC 3-WAY MERGE
         merged_level = max(current_save.level, request.level)
 
+        # Priority 3 Fix: Operation-based inventory reconciliation.
+        # Stale devices MUST NOT restore already-consumed boosters!
+        base_save = await self.save_repo.get_by_revision(player_id, request.base_revision_id)
         merged_inventory = dict(current_save.inventory)
-        for item, count in request.inventory.items():
-            merged_inventory[item] = max(merged_inventory.get(item, 0), count)
+
+        if base_save and base_save.inventory:
+            # Reconcile via client delta:
+            # delta = client_inventory - base_inventory
+            for item in set(list(request.inventory.keys()) + list(base_save.inventory.keys())):
+                client_qty = request.inventory.get(item, 0)
+                base_qty = base_save.inventory.get(item, 0)
+                delta = client_qty - base_qty
+                # Apply delta to server's current authoritative inventory
+                server_current_qty = current_save.inventory.get(item, 0)
+                merged_inventory[item] = max(0, server_current_qty + delta)
+        else:
+            # Fallback when base snapshot is unavailable: server authoritative inventory PREVAILS.
+            # Stale client values are discarded to prevent booster re-inflation.
+            merged_inventory = dict(current_save.inventory)
 
         merged_game_state = request.game_state if request.level >= current_save.level else current_save.game_state
         next_revision = current_save.revision_id + 1

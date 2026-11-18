@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.migration import MigrationRecord
@@ -13,6 +13,20 @@ from backend.app.schemas.migration import (
     MigrationResultResponse,
 )
 from backend.app.models.base import utc_now
+
+# Priority 1: Documented Historical Coin Packs (v2.0 - v2.4, Fact 4)
+# In v2.4, players bought coin packs. Only documented coin packs are credited as purchased coins.
+# Gem packs and No Ads bundles are strictly excluded from coin purchase calculations.
+HISTORICAL_COIN_PACK_CATALOG: Dict[str, int] = {
+    "coin_pack_small": 500,
+    "coin_pack_medium": 1200,
+    "coin_pack_large": 2500,
+    "coin_pack_chest": 6500,
+    "coin_pack_vault": 15000,
+    "coin_pack_starter": 500,
+    "legacy_coin_pack_500": 500,
+    "legacy_coin_pack_1000": 1000,
+}
 
 
 class MigrationService:
@@ -75,20 +89,36 @@ class MigrationService:
         wallet = await self.wallet_repo.get_wallet(player_id, for_update=True)
         save = await self.save_repo.get_latest_save(player_id)
 
-        # Determine current legacy coins balance
+        # Priority 1 Fix: NEVER accept a client-supplied legacy_coins value as authoritative.
+        # Use exclusively the trusted server-side wallet balance / snapshot.
         current_coins = wallet.coins_balance
-        if request and request.legacy_coins is not None:
-            current_coins = max(current_coins, request.legacy_coins)
 
-        # 3. Calculate lifetime purchased coins from purchase_records
+        # 3. Calculate lifetime purchased coins from actual historical coin packs
+        # Fact 4: Server has record of each coin pack bought: player, pack, number of coins, time.
+        # Strictly exclude gem purchases (gems_tier_*) and No Ads purchases (no_ads_*).
         purchase_query = select(PurchaseRecord).where(
             PurchaseRecord.player_id == player_id,
-            PurchaseRecord.verification_status == "VERIFIED",
+            PurchaseRecord.verification_status.in_(["VERIFIED", "LEGACY"]),
         )
-        purchases = (await self.session.execute(purchase_query)).scalars().all()
-        lifetime_purchased_coins = sum(p.price_cents * 10 for p in purchases) if purchases else 0
+        all_purchases = (await self.session.execute(purchase_query)).scalars().all()
+
+        lifetime_purchased_coins = 0
+        for p in all_purchases:
+            # Exclude non-coin purchases explicitly
+            if p.product_id.startswith("gems_") or "no_ads" in p.product_id:
+                continue
+
+            if p.product_id in HISTORICAL_COIN_PACK_CATALOG:
+                lifetime_purchased_coins += HISTORICAL_COIN_PACK_CATALOG[p.product_id]
+            elif p.raw_receipt and isinstance(p.raw_receipt, dict) and "coins_in_pack" in p.raw_receipt:
+                lifetime_purchased_coins += int(p.raw_receipt["coins_in_pack"])
+            elif p.purchase_type == "COIN_PACK":
+                # Known coin pack without catalog mapping: fallback only if explicitly documented
+                pass
 
         # 4. Apply the Approved Policy: PURCHASED-FIRST PROTECTION (PFP)
+        # Gems = min(current_coins, lifetime_purchased_coins)
+        # Coins = current_coins - Gems
         converted_gems = min(current_coins, lifetime_purchased_coins)
         converted_coins = current_coins - converted_gems
 
@@ -140,7 +170,6 @@ class MigrationService:
                 metadata={"converted_from_coins": converted_gems},
             )
         else:
-            # If 0 gems converted (Pure F2P), just touch lock version
             wallet.lock_version += 1
             wallet.updated_at = utc_now()
 

@@ -167,6 +167,7 @@ async def test_support_incident_3_no_ads_preservation(db_session):
         # 2. Old tablet using legacy v2.4 sync with no_ads: false
         legacy_res = await client.post(
             "/api/v1/legacy/sync",
+            headers={"X-Device-Id": "phone_user"},
             json={
                 "player_id": player_id,
                 "saved_at": int(datetime.now(timezone.utc).timestamp()),

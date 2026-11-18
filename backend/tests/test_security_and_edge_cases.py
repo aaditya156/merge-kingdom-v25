@@ -650,3 +650,78 @@ async def test_concurrent_simultaneous_migration_requests(db_session):
 
     app.dependency_overrides.clear()
 
+
+@pytest.mark.asyncio
+async def test_non_coin_purchase_with_positive_coins_in_pack_cannot_inflate_purchased_coins(db_session):
+    """Test 13: Non-COIN_PACK purchases (ENTITLEMENT, CURRENCY) with positive coins_in_pack cannot inflate purchased coins."""
+    app.dependency_overrides[get_db] = app_db_override
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login = await client.post(
+            "/api/v1/auth/device-login",
+            json={"player_id": "p_non_coin_pack_test", "device_id": "dev_ncp", "platform": "Android", "app_version": "2.4", "os_version": "Android 11"},
+        )
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Wallet has 5000 coins
+        await db_session.execute(
+            Wallet.__table__.update()
+            .where(Wallet.player_id == "p_non_coin_pack_test")
+            .values(coins_balance=5000, gems_balance=0)
+        )
+
+        # 1. Non-coin purchase (ENTITLEMENT, e.g. No Ads bundle) with positive coins_in_pack=2000
+        p_entitlement = PurchaseRecord(
+            player_id="p_non_coin_pack_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_entitlement_with_coins",
+            product_id="no_ads_bundle",
+            purchase_type="ENTITLEMENT",  # Non-COIN_PACK!
+            coins_in_pack=2000,
+            price_cents=499,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        # 2. Gem purchase with purchase_type="CURRENCY" and coins_in_pack=3000
+        p_gem = PurchaseRecord(
+            player_id="p_non_coin_pack_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_gem_with_coins",
+            product_id="gems_tier_3",
+            purchase_type="CURRENCY",  # Non-COIN_PACK!
+            coins_in_pack=3000,
+            price_cents=999,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        # 3. Legitimate COIN_PACK purchase (500 coins)
+        p_coin = PurchaseRecord(
+            player_id="p_non_coin_pack_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_legit_coin_pack",
+            product_id="coin_pack_starter",
+            purchase_type="COIN_PACK",  # Strictly COIN_PACK!
+            coins_in_pack=500,
+            price_cents=99,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        db_session.add_all([p_entitlement, p_gem, p_coin])
+        await db_session.commit()
+
+        # Execute migration
+        res = await client.post("/api/v1/migration/migrate", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+
+        # Lifetime purchased coins must strictly be 500 (from p_coin ONLY).
+        # p_entitlement (2000) and p_gem (3000) MUST be strictly excluded!
+        assert data["lifetime_purchased_coins"] == 500
+        assert data["converted_gems"] == 500
+        assert data["converted_coins"] == 4500
+
+    app.dependency_overrides.clear()
+
+

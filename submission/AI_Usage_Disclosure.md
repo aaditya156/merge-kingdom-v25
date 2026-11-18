@@ -15,7 +15,7 @@ The workflow followed four structured phases:
 1. **Fact Ingestion & Grounding:** Fed the 5-page assignment brief into context. Required the AI to cite exact facts, code snippets, and support tickets without external assumptions.
 2. **Policy Formulation & Trade-Offs:** Explored conversion models under missing coin spending history (Fact 4). Directed the AI to discard unrecorded estimates and formalize the Purchased-First Protection (PFP) policy.
 3. **Architecture & Service Implementation:** Generated FastAPI, SQLAlchemy 2.0 async models, and Alembic migrations under strict separation of concerns (saves, wallets, entitlements).
-4. **Adversarial Audit & Targeted Hardening:** Mandated an independent, zero-trust audit that implemented and executed 32 automated stress tests, uncovering and patching **10 critical integrity and security defects**.
+4. **Adversarial Audit & Targeted Hardening:** Mandated an independent, zero-trust audit that implemented and executed 33 automated stress tests, uncovering and patching **10 critical integrity and security defects**.
 
 ---
 
@@ -39,8 +39,8 @@ The workflow followed four structured phases:
 | **Blocking Forced-Update Dialog** | **REJECTED.** Replaced with non-blocking dual-version compatibility. | Fact 5 shows 10% of players are on v2.0–2.1 (~half on Android 7, which cannot update), and the prior forced update lost 18% of players. A hard cutoff destroys DAU. |
 | **Enterprise Accounting Multi-Account Ledger** | **MODIFIED.** Simplified to an append-only player transaction log. | Trimmed excessive enterprise balance-sheet machinery to maintain a lightweight, maintainable monolithic service. |
 | **Client-Supplied Migration Balance** | **REJECTED.** Enforced server-authoritative save snapshot. | Accepting client-supplied legacy coins invites trivial balance inflation attacks. |
-| **Guessed Multiplier (`price_cents * 10`)** | **REJECTED.** Replaced with actual recorded historical coin quantities. | Fact 4 explicitly records the number of coins in the pack. Using guessed catalog multipliers distorted conversion calculations. |
-| **Absent Header Bypass on Legacy Sync** | **REJECTED.** Made device authentication mandatory. | An absent `X-Device-Id` allowed unauthorized callers to overwrite existing saves. Missing headers now strictly return `401 Unauthorized`. |
+| **Guessed Multiplier (`price_cents * 10`)** | **REJECTED.** Restricted strictly to verified `COIN_PACK` purchases with recorded quantities. | Fact 4 explicitly records the number of coins in the pack. Using guessed catalog multipliers distorted conversion calculations. |
+| **Absent Header Bypass on Legacy Sync** | **REJECTED.** Made device identification mandatory. | An absent `X-Device-Id` allowed unauthorized callers to overwrite existing saves. Missing headers now strictly return `401 Unauthorized`. |
 | **Naive Inventory `max()` Union** | **MODIFIED.** Replaced with base-save delta reconciliation & unique operation IDs. | Taking `max()` across devices allowed offline devices to duplicate spent boosters. |
 
 ---
@@ -54,13 +54,13 @@ During the adversarial technical audit and targeted hardening passes, ten critic
    * *Fix:* Removed client overrides; migration calculates balances strictly from the server-authoritative save snapshot.
 2. **Inaccurate Historical Coin Calculation & Guessed Multipliers (`migration_service.py`):**
    * *Defect:* Multiplied purchase prices by guessed multipliers or hardcoded catalog values, erroneously including gem packs and No Ads purchases.
-   * *Fix:* Used the actual recorded historical coin quantity recorded on the purchase record (`p.coins_in_pack` or `raw_receipt["coins_in_pack"]`). Unrecorded or corrupted purchases are flagged in `unresolved_purchases` for Finance review rather than guessed.
+   * *Fix:* Strictly restricted calculations to historical purchases where `purchase_type == 'COIN_PACK'`, reading the actual recorded historical coin quantity (`coins_in_pack` or `raw_receipt['coins_in_pack']`). Unrecorded or corrupted purchases are flagged in `unresolved_purchases` for Finance review rather than guessed.
 3. **Forged Legacy No Ads Entitlement (`legacy.py`):**
    * *Defect:* Legacy sync granted permanent `no_ads` based purely on client payload `payload.no_ads = True`.
    * *Fix:* Required verified historical server purchase records before granting entitlement; unbacked flags are ignored.
-4. **Absent Header Bypass on Legacy Device Auth (`legacy.py`):**
+4. **Absent Header Bypass on Legacy Device Identification (`legacy.py`):**
    * *Defect:* Old clients without `X-Device-Id` bypassed verification, allowing rogue callers to modify existing player saves.
-   * *Fix:* Mandatory `X-Device-Id`. Missing headers return `401 Unauthorized`. Defined an initial account-binding strategy and rejected subsequent unauthorized devices with `403 Forbidden`.
+   * *Fix:* Mandatory `X-Device-Id`. Missing headers return `401 Unauthorized`. Defined a TOFU initial account-binding strategy and rejected subsequent unauthorized devices with `403 Forbidden`. Documented that production requires federated authentication or out-of-band recovery.
 5. **Consumable Booster Duplication & Replay (`save_sync_service.py`):**
    * *Defect:* Inventory union via `max()` restored spent boosters when a stale device reconnected, and offline operations could be replayed.
    * *Fix:* Implemented operation-based delta reconciliation against `base_save` combined with unique client `operation_id` tracking and server-side deduplication in `offline_operations`.
@@ -84,11 +84,11 @@ During the adversarial technical audit and targeted hardening passes, ten critic
 
 ## 5. Actual Test Verification Results
 
-All 32 automated test suites were executed against the hardened prototype:
-* **Total Automated Tests:** 32/32 Passed (100% pass rate in ~2.45s)
-* **Statement Coverage:** **93%** across `backend/app/` (1,080 statements, 73 missed)
-* **Branch Coverage:** **91%** across all branch points (128 branches, 19 partial)
-* **Module Highlights:** Models (100%), Schemas (100%), Legacy Adapter (93%), Wallet Service (100%), Purchase Service (93%), Save Sync Service (79% statement / 76% combined), Migration Service (86% statement / 83% combined).
+All 33 automated test suites were executed against the hardened prototype:
+* **Total Automated Tests:** 33/33 Passed (100% pass rate in ~2.52s)
+* **Statement Coverage:** **93%** across `backend/app/` (1,082 statements, 74 missed)
+* **Branch Coverage:** **91%** across all branch points (130 branches, 20 partial)
+* **Module Highlights:** Models (100%), Schemas (100%), Legacy Adapter (93%), Wallet Service (100%), Purchase Service (93%), Save Sync Service (79% statement / 76% combined), Migration Service (85% statement / 81% combined).
 
 ---
 
@@ -107,4 +107,4 @@ All 32 automated test suites were executed against the hardened prototype:
 
 ## 7. Raw Conversation Logs
 
-*Note for Reviewers:* Complete, unedited raw conversation transcripts detailing all interactive prompts, model suggestions, human overrides, and terminal commands will be exported and attached separately alongside this repository submission.
+*Note for Reviewers:* Complete, unedited raw conversation transcripts detailing all interactive prompts, model suggestions, human overrides, and terminal commands will be provided separately by the applicant upon submission.

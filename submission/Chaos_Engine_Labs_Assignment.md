@@ -20,7 +20,7 @@ This document presents the technical analysis, system architecture, and verified
 2. **Purchased-First Protection (PFP):** A defensible policy assumption converting remaining coins up to lifetime coin purchases into gems (`Gems = min(Current_Coins, Lifetime_Purchased_Coins)`). Because historical coin spending was never recorded on the server, PFP cannot prove the true origin of remaining coins or guarantee absolute economic fairness, but it guarantees zero loss on paid value.
 3. **Append-Only Transaction Log:** Implemented an append-only transaction ledger recording signed balance deltas, balances before/after, and idempotency keys (distinct from a multi-account accounting double-entry ledger).
 4. **Permanent Dual-Mode Compatibility:** Maintained the `/legacy/sync` adapter for the ~5% of daily players locked on Android 7 who cannot update, avoiding the catastrophic 18% churn observed during past forced updates.
-5. **Empirically Verified Prototype:** Validated via an automated test suite achieving **95% branch coverage** across 28 stress, security, and chaos scenarios on an asynchronous test database.
+5. **Empirically Verified Prototype:** Validated via an automated test suite achieving **93% statement coverage** and **91% branch coverage** across 33 stress, security, and chaos scenarios on an asynchronous test database.
 
 ---
 
@@ -163,8 +163,10 @@ Save payloads contain pure gameplay state only:
 * **Verification (`/purchases/verify`):** Validates receipts against catalog, checks unique constraint on `store_transaction_id`, rejects unknown product IDs, and ensures transactions cannot be claimed across different player accounts. (In production, this requires connecting StoreKit 2 and Google Play Developer API).
 * **Entitlements:** Stored in `entitlements` table (`entitlement_key`, `is_active`, `granted_at`). Permanent purchases cannot be overwritten by save syncs.
 
-### 3.5 Legacy Adapter Security (`/legacy/sync`)
-* **Mandatory Device Authentication:** Requires `X-Device-Id`. Missing headers strictly return `401 Unauthorized`; unknown or unbound devices attempting to access an existing registered account return `403 Forbidden`. Initial account binding securely binds the calling device on the first authorized sync for accounts without registered devices.
+### 3.5 Legacy Adapter & Device Identification (`/legacy/sync`)
+* **Device Identification vs. Authentication:** `X-Device-Id` is a client-supplied identifier, not a cryptographic authentication credential. The endpoint enforces a Trust-On-First-Use (TOFU) heuristic: missing headers strictly return `401 Unauthorized`; the first authorized call binds the identifier, and subsequent unknown devices are rejected with `403 Forbidden`. This provides basic coordination for legacy clients, but is not production-grade authentication.
+* **Production Account Recovery Strategy:** In production, legacy account binding must be elevated via federated identity (Google Play Games Services, Sign in with Apple) or an out-of-band account recovery flow (email/SMS magic link or Customer Support verification token).
+* **Legacy Inventory Compatibility Trade-Off:** v2.0–v2.4 clients transmit raw inventory snapshots without base revision IDs or operation IDs. Full 3-way delta reconciliation is impossible for legacy clients; the adapter intentionally preserves the server's authoritative inventory to prevent stale legacy saves from re-inflating items consumed on v2.5 clients. Full offline operation deduplication requires the v2.5 client.
 * **No Ads Restoration Evidence:** Does **not** grant No Ads based on client `payload.no_ads`. Entitlements are only restored if trusted purchase records exist.
 * **Post-Migration Protection:** If the player has already migrated to v2.5, legacy coin uploads cannot overwrite the wallet balance.
 
@@ -213,7 +215,7 @@ Because coin spending occurred purely client-side without transaction logging, *
 
 ### 4.4 Financial Implications & Sign-Off Requirements
 * **Policy Assumption (Not Economic Proof):** PFP incorporates an intentional pro-consumer bias: it assumes players spent free gameplay coins before spending purchased coins. In reality, some players spent purchased coins first. Converting their remaining balance to gems grants them paid value for what were originally gameplay earnings. This is the calculated business cost of guaranteeing zero loss.
-* **Historical Purchase Record Extraction:** The server records the exact historical coin quantity (`coins_in_pack`) for each coin purchase (Fact 4). The migration engine relies strictly on recorded quantities without guessed price multipliers or invented catalog mappings. Purchases with missing or invalid quantities are flagged in `unresolved_purchases` for Finance audit rather than guessed.
+* **Historical Purchase Record Extraction:** Calculations are strictly restricted to verified historical purchases where `purchase_type == "COIN_PACK"`. Gem packs, entitlements, and non-coin items are completely excluded even if containing coin fields. The migration engine relies strictly on recorded quantities (`coins_in_pack`) without guessed price multipliers or invented catalog mappings. Purchases with missing or invalid quantities are flagged in `unresolved_purchases` for Finance review.
 * **Concurrent Migration Safety:** Wrapped in a transaction-safe strategy using the database uniqueness constraint on `MigrationRecord.player_id`. Simultaneous migration requests for the same player resolve idempotently without double-converting balances.
 * **Deferred Revenue Liability:** Unspent gems represent balance sheet liabilities under IFRS 15 / ASC 606 until consumed.
 * **Rollback Limitations:** If a player migrates, converts coins to gems, and immediately spends those gems on store items, a naive rollback cannot simply deduct gems without driving the wallet negative. Rollbacks require manual audit reconciliation when converted currency has been consumed.
@@ -280,22 +282,23 @@ We will **NOT** deploy a blocking forced-update dialog.
 
 ## Prototype Test Verification
 
-The live backend prototype was verified across 28 automated tests:
+The live backend prototype was verified across 33 automated tests:
 
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0
 rootdir: /Users/adityatiwary/Desktop/merge-kingdom-v25/backend
 
-tests/test_audit_and_stress.py (12 tests) ............                   [ 42%]
-tests/test_auth.py (1 test) .                                            [ 46%]
-tests/test_database.py (1 test) .                                        [ 50%]
-tests/test_migration.py (1 test) .                                       [ 53%]
-tests/test_saves_and_sync.py (3 tests) ...                               [ 64%]
-tests/test_security_and_edge_cases.py (8 tests) ........                 [ 92%]
+tests/test_audit_and_stress.py (12 tests) ............                   [ 36%]
+tests/test_auth.py (1 test) .                                            [ 39%]
+tests/test_database.py (1 test) .                                        [ 42%]
+tests/test_migration.py (1 test) .                                       [ 45%]
+tests/test_saves_and_sync.py (3 tests) ...                               [ 54%]
+tests/test_security_and_edge_cases.py (13 tests) .............            [ 93%]
 tests/test_wallet_and_purchases.py (2 tests) ..                          [100%]
 
 ================================ tests coverage ================================
-TOTAL: 996 Statements, 52 Missed -> 95% Code Coverage
-============================== 28 passed in 2.03s ==============================
+Statement Coverage: 93% (1,082 Statements, 74 Missed)
+Branch Coverage: 91% (130 Branches, 20 Partial)
+============================== 33 passed in 2.52s ==============================
 ```

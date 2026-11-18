@@ -25,22 +25,35 @@ async def legacy_sync(
     session: Annotated[AsyncSession, Depends(get_db)],
     x_device_id: Annotated[Optional[str], Header(alias="X-Device-Id")] = None,
 ):
+    """
+    Legacy sync endpoint for Merge Kingdom v2.0-v2.4 clients (Android 7 and non-updated players).
+
+    PROTOTYPE AUTHENTICATION LIMITATION:
+    X-Device-Id is a client-supplied device identifier, NOT a cryptographic authentication credential.
+    First-caller binding follows a Trust-On-First-Use (TOFU) heuristic for backward compatibility.
+    It prevents accidental overwrites from uncoordinated devices, but does NOT provide production-grade
+    security against malicious spoofing on rooted devices.
+
+    PROPOSED PRODUCTION SAFEGUARD:
+    Production deployments must bind legacy accounts via federated authentication (Google Play Games,
+    Sign in with Apple) or an out-of-band account recovery flow (email/SMS magic link or Customer Support token).
+    """
     player_repo = PlayerRepository(session)
     save_repo = SaveRepository(session)
 
-    # 1. Device authentication & secure account-binding strategy for legacy clients:
+    # 1. Device Identification & TOFU Binding for legacy clients:
     # An absent, empty, or whitespace-only X-Device-Id MUST NOT bypass verification.
     if not x_device_id or not x_device_id.strip():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing required header: X-Device-Id. Legacy device authentication is mandatory.",
+            detail="Missing required header: X-Device-Id. Device identification is mandatory.",
         )
 
     clean_device_id = x_device_id.strip()
     player = await player_repo.get_by_id(payload.player_id, load_devices=True)
 
     if not player:
-        # Initial registration & account binding for newly discovered legacy player
+        # Initial registration & TOFU binding for newly discovered legacy player
         player = await player_repo.create_player(payload.player_id)
         await player_repo.register_device(
             player_id=payload.player_id,
@@ -59,8 +72,7 @@ async def legacy_sync(
                     detail="Unauthorized: Device is not bound to this player account.",
                 )
         else:
-            # Secure initial binding for existing accounts lacking registered devices
-            # The first authorized legacy call binds clean_device_id to this player profile
+            # TOFU initial binding for existing accounts lacking registered devices
             await player_repo.register_device(
                 player_id=payload.player_id,
                 device_id=clean_device_id,
@@ -109,6 +121,11 @@ async def legacy_sync(
     if current_save:
         next_revision = current_save.revision_id + 1
         resolved_level = max(current_save.level, payload.level)
+        # LEGACY INVENTORY COMPATIBILITY TRADE-OFF & LIMITATION:
+        # v2.0-v2.4 clients transmit raw inventory snapshots without base revision IDs or operation IDs.
+        # The legacy adapter cannot perform 3-way delta reconciliation on old clients.
+        # To prevent stale legacy saves from re-inflating items consumed on v2.5 clients, server
+        # inventory is preserved. Full delta reconciliation is only available on v2.5+ clients.
         merged_inventory = dict(current_save.inventory)
 
     await save_repo.create_or_update_save(

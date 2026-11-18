@@ -91,8 +91,12 @@ class MigrationService:
             unresolved_purchases: List[Dict[str, Any]] = []
 
             for p in all_purchases:
-                # Exclude non-coin purchases explicitly
-                if p.product_id.startswith("gems_") or "no_ads" in p.product_id or p.purchase_type == "ENTITLEMENT":
+                # Explicitly restrict migration calculations strictly to historical COIN_PACK purchases.
+                # All other purchase types (CURRENCY, ENTITLEMENT, HYBRID, GEM_PACKS) are strictly excluded.
+                if p.purchase_type != "COIN_PACK":
+                    continue
+
+                if p.product_id.startswith("gems_") or "no_ads" in p.product_id:
                     continue
 
                 # Extract recorded historical coin quantity:

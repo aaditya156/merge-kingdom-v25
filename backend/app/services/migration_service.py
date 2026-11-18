@@ -1,5 +1,5 @@
 from typing import Optional
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.migration import MigrationRecord
 from backend.app.models.purchase import PurchaseRecord
@@ -37,7 +37,6 @@ class MigrationService:
                 migrated_at=record.migrated_at,
             )
 
-        # Check if player has an existing save or wallet balance
         wallet = await self.wallet_repo.get_wallet(player_id)
         save = await self.save_repo.get_latest_save(player_id)
 
@@ -82,21 +81,14 @@ class MigrationService:
             current_coins = max(current_coins, request.legacy_coins)
 
         # 3. Calculate lifetime purchased coins from purchase_records
-        # Fact 4: Server has record of each coin pack bought: player, pack, number of coins
         purchase_query = select(PurchaseRecord).where(
             PurchaseRecord.player_id == player_id,
             PurchaseRecord.verification_status == "VERIFIED",
         )
         purchases = (await self.session.execute(purchase_query)).scalars().all()
-        
-        # Calculate purchased coins from legacy purchase records (or product catalog)
         lifetime_purchased_coins = sum(p.price_cents * 10 for p in purchases) if purchases else 0
-        # If legacy purchase records specifically hold coins, we use that; fallback to 0 for pure F2P
-        # (Support for mock/historical data)
 
         # 4. Apply the Approved Policy: PURCHASED-FIRST PROTECTION (PFP)
-        # Gems = min(current_coins, lifetime_purchased_coins)
-        # Coins = current_coins - Gems
         converted_gems = min(current_coins, lifetime_purchased_coins)
         converted_coins = current_coins - converted_gems
 
@@ -123,23 +115,34 @@ class MigrationService:
             migrated_at=utc_now(),
         )
         self.session.add(mig_record)
+        await self.session.flush()
 
-        # 7. Update wallet & record ledger transactions
-        wallet.coins_balance = converted_coins
-        wallet.gems_balance = converted_gems
-        wallet.lock_version += 1
-        wallet.updated_at = utc_now()
-
-        # Ledger entries
-        await self.wallet_repo.mutate_balance(
-            player_id=player_id,
-            currency_type="GEM",
-            amount=0,  # Snapshot update
-            transaction_type="MIGRATION_CONVERSION",
-            reference_id=mig_record.id,
-            idempotency_key=f"mig_gem_{player_id}",
-            metadata={"converted_from_coins": converted_gems},
-        )
+        # 7. Record balanced audit ledger entries
+        if converted_gems > 0:
+            # Debit converted coins from wallet
+            await self.wallet_repo.mutate_balance(
+                player_id=player_id,
+                currency_type="COIN",
+                amount=-converted_gems,
+                transaction_type="MIGRATION_CONVERSION",
+                reference_id=mig_record.id,
+                idempotency_key=f"mig_debit_coin_{player_id}",
+                metadata={"converted_to_gems": converted_gems},
+            )
+            # Credit converted gems into wallet
+            await self.wallet_repo.mutate_balance(
+                player_id=player_id,
+                currency_type="GEM",
+                amount=converted_gems,
+                transaction_type="MIGRATION_CONVERSION",
+                reference_id=mig_record.id,
+                idempotency_key=f"mig_credit_gem_{player_id}",
+                metadata={"converted_from_coins": converted_gems},
+            )
+        else:
+            # If 0 gems converted (Pure F2P), just touch lock version
+            wallet.lock_version += 1
+            wallet.updated_at = utc_now()
 
         await self.session.flush()
 

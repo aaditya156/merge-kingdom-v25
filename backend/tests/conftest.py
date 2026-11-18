@@ -1,3 +1,4 @@
+import os
 import pytest
 import pytest_asyncio
 from collections.abc import AsyncGenerator
@@ -17,31 +18,41 @@ from backend.app.models import (
     AuditLog,
 )
 
-# Test in-memory SQLite async engine
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+TEST_DB_FILE = "./test_run.db"
+TEST_DATABASE_URL = f"sqlite+aiosqlite:///{TEST_DB_FILE}"
+
+test_engine = create_async_engine(
+    TEST_DATABASE_URL,
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
+
+TestSessionLocal = async_sessionmaker(
+    bind=test_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+)
 
 
 @pytest_asyncio.fixture(scope="function")
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    engine = create_async_engine(
-        TEST_DATABASE_URL,
-        echo=False,
-        connect_args={"check_same_thread": False},
-    )
-    async_session = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        autoflush=False,
-    )
-
-    async with engine.begin() as conn:
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
-    async with async_session() as session:
+    async with TestSessionLocal() as session:
         yield session
 
-    async with engine.begin() as conn:
+    async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
-    await engine.dispose()
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_db():
+    yield
+    if os.path.exists(TEST_DB_FILE):
+        try:
+            os.remove(TEST_DB_FILE)
+        except OSError:
+            pass

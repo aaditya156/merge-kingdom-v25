@@ -1,5 +1,5 @@
 from typing import Optional, List
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.wallet import Wallet
 from backend.app.models.ledger import CurrencyTransaction
@@ -28,12 +28,11 @@ class WalletRepository:
     async def get_wallet(self, player_id: str, for_update: bool = False) -> Wallet:
         query = select(Wallet).where(Wallet.player_id == player_id)
         if for_update:
-            # PostgreSQL supports with_for_update(). SQLite ignores it gracefully.
             query = query.with_for_update()
         result = await self.session.execute(query)
         wallet = result.scalar_one_or_none()
         if not wallet:
-            wallet = Wallet(player_id=player_id, coins_balance=0, gems_balance=0)
+            wallet = Wallet(player_id=player_id, coins_balance=0, gems_balance=0, lock_version=0)
             self.session.add(wallet)
             await self.session.flush()
         return wallet
@@ -70,8 +69,9 @@ class WalletRepository:
                 wallet = await self.get_wallet(player_id, for_update=False)
                 return wallet, existing
 
-        # 2. Lock wallet row exclusively
+        # 2. Lock wallet row exclusively & capture current version
         wallet = await self.get_wallet(player_id, for_update=True)
+        initial_version = wallet.lock_version
 
         # 3. Check balance
         current_balance = wallet.coins_balance if currency_type == "COIN" else wallet.gems_balance
@@ -84,7 +84,45 @@ class WalletRepository:
                 available=current_balance,
             )
 
-        # 4. Create immutable ledger record
+        # 4. Atomic conditional update on lock_version (Optimistic Concurrency Control)
+        update_values = {
+            "lock_version": initial_version + 1,
+            "updated_at": utc_now(),
+        }
+        if currency_type == "COIN":
+            update_values["coins_balance"] = new_balance
+        else:
+            update_values["gems_balance"] = new_balance
+
+        result = await self.session.execute(
+            update(Wallet)
+            .where(Wallet.id == wallet.id, Wallet.lock_version == initial_version)
+            .values(**update_values)
+        )
+
+        if result.rowcount == 0:
+            # OCC collision: Another concurrent transaction modified the wallet in the interim
+            # Re-read fresh state and re-check balance
+            await self.session.rollback()
+            fresh_wallet = await self.get_wallet(player_id, for_update=True)
+            fresh_balance = fresh_wallet.coins_balance if currency_type == "COIN" else fresh_wallet.gems_balance
+            if fresh_balance + amount < 0:
+                raise InsufficientFundsException(
+                    currency_type=currency_type,
+                    required=abs(amount),
+                    available=fresh_balance,
+                )
+            return await self.mutate_balance(
+                player_id=player_id,
+                currency_type=currency_type,
+                amount=amount,
+                transaction_type=transaction_type,
+                reference_id=reference_id,
+                idempotency_key=idempotency_key,
+                metadata=metadata,
+            )
+
+        # 5. Create immutable ledger record
         tx = CurrencyTransaction(
             wallet_id=wallet.id,
             player_id=player_id,
@@ -99,14 +137,12 @@ class WalletRepository:
         )
         self.session.add(tx)
 
-        # 5. Update wallet balance snapshot
+        # Refresh local wallet object
         if currency_type == "COIN":
             wallet.coins_balance = new_balance
         else:
             wallet.gems_balance = new_balance
-
-        wallet.lock_version += 1
-        wallet.updated_at = utc_now()
+        wallet.lock_version = initial_version + 1
 
         await self.session.flush()
         return wallet, tx

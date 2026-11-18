@@ -9,6 +9,7 @@ from backend.app.repositories.player_repo import PlayerRepository
 from backend.app.repositories.save_repo import SaveRepository
 from backend.app.models.entitlement import Entitlement
 from backend.app.models.wallet import Wallet
+from backend.app.models.migration import MigrationRecord
 from backend.app.models.base import utc_now
 
 router = APIRouter(prefix="/legacy", tags=["Legacy Compatibility (v2.0 - v2.4)"])
@@ -78,12 +79,24 @@ async def legacy_sync(
         client_saved_at=datetime.fromtimestamp(payload.saved_at, tz=timezone.utc),
     )
 
-    # Also sync legacy coins to wallet if not yet migrated
+    # 4. Check if player has already migrated to v2.5
+    mig_query = await session.execute(
+        select(MigrationRecord).where(
+            MigrationRecord.player_id == payload.player_id,
+            MigrationRecord.status == "COMPLETED"
+        )
+    )
+    mig_record = mig_query.scalar_one_or_none()
+
     wallet_query = await session.execute(
         select(Wallet).where(Wallet.player_id == payload.player_id)
     )
     wallet = wallet_query.scalar_one_or_none()
-    if wallet:
+
+    # CRITICAL AUDIT FIX: If player already migrated, DO NOT re-inflate coins from v2.4!
+    # Doing so would allow double-spending (player keeps converted gems AND gets coins back).
+    # Only update coins if not migrated yet.
+    if wallet and not mig_record:
         wallet.coins_balance = max(wallet.coins_balance, payload.coins)
 
     # Return standard v2.4 JSON structure with current server timestamp

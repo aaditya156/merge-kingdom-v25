@@ -1,4 +1,5 @@
 from typing import List, Optional
+from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.repositories.wallet_repo import WalletRepository, InsufficientFundsException
 from backend.app.schemas.wallet import (
@@ -45,13 +46,16 @@ class WalletService:
         request: EarnCoinsRequest,
         idempotency_key: Optional[str] = None,
     ) -> SpendResponse:
+        # Prevent level reward farming: Level rewards are idempotent per player per level
+        effective_key = idempotency_key or f"level_reward_{player_id}_lvl_{request.level_completed}"
+
         wallet, tx = await self.wallet_repo.mutate_balance(
             player_id=player_id,
             currency_type="COIN",
             amount=request.coins_earned,
             transaction_type="LEVEL_REWARD",
             reference_id=f"level_{request.level_completed}",
-            idempotency_key=idempotency_key,
+            idempotency_key=effective_key,
             metadata={"score": request.score, "level": request.level_completed},
         )
         return SpendResponse(

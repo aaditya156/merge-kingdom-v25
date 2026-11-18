@@ -1,9 +1,14 @@
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple
+from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.repositories.save_repo import SaveRepository
 from backend.app.schemas.save import SaveSyncRequest, SyncResultResponse, GameSaveResponse
 from backend.app.models.base import utc_now
+
+# Max legitimate level jump in a single offline sync batch
+MAX_ALLOWED_LEVEL_JUMP = 100
 
 
 class SaveSyncService:
@@ -14,7 +19,6 @@ class SaveSyncService:
     async def get_latest_save(self, player_id: str) -> GameSaveResponse:
         save = await self.save_repo.get_latest_save(player_id)
         if not save:
-            # Create a default initial save if none exists
             save = await self.save_repo.create_or_update_save(
                 player_id=player_id,
                 revision_id=1,
@@ -50,46 +54,52 @@ class SaveSyncService:
                 message="Initial save created.",
             )
 
-        # Case 2: Clean sequential update (base_revision_id == current_save.revision_id)
+        # Progression Sanity Check: Prevent fraudulent level spoofing (e.g. jumping from level 1 to level 99999)
+        if request.level > current_save.level + MAX_ALLOWED_LEVEL_JUMP:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Progression anomaly detected: Level jump from {current_save.level} to {request.level} exceeds safety limit of {MAX_ALLOWED_LEVEL_JUMP} levels.",
+            )
+
+        # Case 2: Clean sequential update
         if request.base_revision_id == current_save.revision_id:
             next_revision = current_save.revision_id + 1
-            # Monotonicity check on level: cannot regress below current server level
             resolved_level = max(current_save.level, request.level)
             
-            saved = await self.save_repo.create_or_update_save(
-                player_id=player_id,
-                revision_id=next_revision,
-                level=resolved_level,
-                inventory=request.inventory,
-                game_state=request.game_state,
-                device_id=request.device_id,
-                client_saved_at=request.client_saved_at,
-            )
-            return SyncResultResponse(
-                status="ACCEPTED",
-                revision_id=saved.revision_id,
-                level=saved.level,
-                inventory=saved.inventory,
-                game_state=saved.game_state,
-                server_saved_at=saved.server_saved_at,
-                message="Save accepted cleanly.",
-            )
+            try:
+                saved = await self.save_repo.create_or_update_save(
+                    player_id=player_id,
+                    revision_id=next_revision,
+                    level=resolved_level,
+                    inventory=request.inventory,
+                    game_state=request.game_state,
+                    device_id=request.device_id,
+                    client_saved_at=request.client_saved_at,
+                )
+                return SyncResultResponse(
+                    status="ACCEPTED",
+                    revision_id=saved.revision_id,
+                    level=saved.level,
+                    inventory=saved.inventory,
+                    game_state=saved.game_state,
+                    server_saved_at=saved.server_saved_at,
+                    message="Save accepted cleanly.",
+                )
+            except IntegrityError:
+                # Concurrent write collided at same revision, refresh and fall back to semantic merge
+                await self.session.rollback()
+                current_save = await self.save_repo.get_latest_save(player_id)
 
-        # Case 3: Stale base revision (Concurrent update or offline play from another device)
-        # e.g., Incident 1: Tablet reached level 160 (rev 2). Phone was offline with base_rev 1 and level 151.
-        # SEMANTIC 3-WAY MERGE:
-        # Rule: Never lose progress! Preserve highest level reached.
+        # Case 3: Stale base revision or concurrency collision -> SEMANTIC 3-WAY MERGE
         merged_level = max(current_save.level, request.level)
 
-        # Merge inventory (take maximum count for consumable boosters)
         merged_inventory = dict(current_save.inventory)
         for item, count in request.inventory.items():
             merged_inventory[item] = max(merged_inventory.get(item, 0), count)
 
-        # For game_state, if incoming level is higher, take incoming game_state; else keep current
         merged_game_state = request.game_state if request.level >= current_save.level else current_save.game_state
-
         next_revision = current_save.revision_id + 1
+
         merged_save = await self.save_repo.create_or_update_save(
             player_id=player_id,
             revision_id=next_revision,

@@ -19,11 +19,11 @@ This document presents the technical analysis, systems architecture, and verifie
   * **Store Restructuring:** In-game store items (boosters, energy, premium items) sell exclusively for gems.
 
 ### Core Architectural Decisions & Prototype Verification
-1. **Server-Authoritative Saves:** Eliminated unauthenticated device timestamps as version primitives. Implemented monotonic server-assigned integer revisions (`revision_id`) and semantic conflict resolution, resolving progression rollback (Incident 1) and preventing device-clock manipulation from poisoning cloud saves (Incident 2).
+1. **Server-Authoritative Saves:** Replaced unauthenticated device timestamps with monotonic server-assigned integer revisions (`revision_id`) and semantic conflict resolution, resolving progression rollback (Incident 1) and preventing device-clock manipulation from poisoning cloud saves (Incident 2).
 2. **Purchased-First Protection (PFP):** Formulated an executive policy converting remaining coins up to lifetime purchased coins into gems: `Gems = min(Current_Coins, Lifetime_Purchased_Coins)`. Because the studio never recorded historical coin spending (Fact 4), PFP cannot prove the true origin of remaining coins or guarantee absolute economic fairness across all players. It represents a player-protective policy assumption designed to protect paid purchasing power, which may overcompensate some players (creating studio unearned liability) because spending records are absent.
 3. **Proposed 1:1 Peg Ratio:** The document models an initial working proposal of 1 purchased coin = 1 gem, subject to formal Finance review and calibration against the v2.5 gem store pricing book.
-4. **Decoupled Relational Persistence:** Normalized mutable save blobs, currency wallets, append-only transaction logs, and permanent entitlements into dedicated tables, preventing stale client saves from revoking paid entitlements (Incident 3).
-5. **Permanent Dual-Mode Compatibility:** Maintained a dedicated `/api/v1/legacy/sync` adapter for the ~5% of daily active players locked on Android 7 who cannot update to v2.2+, avoiding the catastrophic 18% player churn observed during past forced updates.
+4. **Decoupled Relational Persistence:** Normalized mutable save blobs, currency wallets, append-only transaction logs, and entitlements into dedicated tables, preventing stale client saves from revoking paid entitlements (Incident 3).
+5. **Dual-Mode Compatibility Adapter:** Maintained a dedicated `/api/v1/legacy/sync` adapter for the ~5% of daily active players on Android 7 devices (which cannot run newer builds), avoiding the 18% player churn observed during a previous forced update.
 6. **Empirically Verified Backend Prototype:** Validated across **33 automated test suites** in Python 3.14 / FastAPI / SQLAlchemy 2.0 async, achieving **93% statement coverage** (1,082 statements, 74 missed) and **91% branch coverage** (130 branch points, 20 partial) across concurrency, double-spends, offline replay, and tamper scenarios.
 
 ---
@@ -67,7 +67,7 @@ public class SaveData {
 | **3. Client-Authoritative Currency** | `coins` is a mutable integer field authored on the client device. | The server has zero transaction ledger. Coins can be manipulated via memory-editing tools on rooted devices without backend validation. |
 | **4. Missing Coin Spend Records (Fact 4)** | The server logs purchase receipts for coin packs, but coin spending occurs purely on the client without server transaction logging. | The backend cannot reconstruct whether remaining coins were earned via gameplay or bought with real money. |
 | **5. Mutable Entitlement Storage** | `no_ads` is stored as a mutable client boolean within the save payload. | A player who purchased No Ads will have their entitlement revoked if an older secondary device connects with `no_ads: false`. |
-| **6. Multi-Device Desynchronization (Fact 2)** | ~9% of daily active players play on more than one device (e.g., commute phone and home tablet). | Multi-device play is a core behavioral pattern, yet these players suffer the brunt of save-overwriting conflicts caused by asynchronous offline play across devices. |
+| **6. Multi-Device Desynchronization (Fact 2)** | ~9% of daily active players play on more than one device (e.g., commute phone and home tablet). | Multi-device play is a core behavioral pattern, making players susceptible to save-overwriting conflicts when playing offline across devices. |
 
 ---
 
@@ -136,19 +136,19 @@ Phone Client:       OnCloudSave compares T_future > T_real -> Overwrites Level 5
 ```
 Illustrative Sequence for Incident 3:
 Phone:   [Buys No Ads at T_purchase] ---> [Saves: no_ads=true, T_purchase] (Server Stores no_ads=true)
-Tablet:  (Dormant in drawer, holding no_ads=false)
-Tablet:  [Powered on at T_later] ---> [Plays 1 level] ---> [Uploads: no_ads=false, T_later]
+Tablet:  (Old tablet, holding no_ads=false)
+Tablet:  [Played at T_later] ---> [Uploads: no_ads=false, T_later]
 Server:  Checks T_later > T_purchase -> TRUE -> Overwrites save with no_ads=false!
 Phone:   Receives server update -> Overwrites local disk -> Paid entitlement REVOKED
 ```
 
 * **Step-by-Step Breakdown:**
-  1. **Purchase on Phone:** Player purchases No Ads on their phone via In-App Purchase at time `T_purchase`. The phone sets `no_ads: true` and uploads `{no_ads: true, saved_at: T_purchase}`.
-  2. **Dormant Tablet Reconnects:** Player powers on an old tablet that had been dormant in a drawer. The tablet's local save file contains `no_ads: false`.
+  1. **Purchase on Phone:** Player purchases No Ads on their phone via In-App Purchase in March (`T_purchase`). The phone sets `no_ads: true` and uploads `{no_ads: true, saved_at: T_purchase}`. Server stores `no_ads: true`.
+  2. **Old Tablet Played Later:** Last week (`T_later`), the player plays on their old tablet. Because the tablet had not recorded the No Ads purchase locally, its save file contains `no_ads: false`.
   3. **Tablet Sync:** The player completes one level on the tablet at time `T_later` (where `T_later > T_purchase`). The tablet sets `saved_at: T_later` and uploads its save containing `no_ads: false`.
   4. **Server Blind Replacement:** The server checks: `T_later > T_purchase`. Because `T_later` is newer, the server unconditionally replaces the entire save file, overwriting `no_ads: true` with `no_ads: false`.
   5. **Entitlement Stripped:** The player's phone synchronizes with the server, reads `no_ads: false`, and resumes showing ads.
-* **Root Cause:** Storing permanent, paid entitlements as mutable client-side boolean flags coupled within monolithic save blobs.
+* **Root Cause:** Storing paid entitlements as mutable client-side boolean flags coupled within monolithic save blobs.
 * **v2.5 Prevention:**
   * Entitlements are decoupled from game saves and stored in a normalized `entitlements` table.
   * Entitlements can only be granted via verified server-side store purchase receipts or authoritative admin actions.
@@ -246,7 +246,7 @@ To avoid ambiguous whole-blob replacements, the v2.5 backend decomposes save dat
 | **1. Level Progression** | Monotonic Max Rule:<br>`Resolved_Level = max(server.level, client.level)` | Preserves player milestone progression across all devices; prevents stale devices from rolling back progress. | Does not validate move-by-move validity on server (heuristic jump limit applied). |
 | **2. Consumable Inventory** | Base-Save Delta Reconciliation:<br>`Delta = client_inv - base_inv`<br>`Resolved = max(0, server_inv + Delta)`<br>+ Unique `operation_id` deduplication | Prevents offline devices from restoring already-consumed boosters when reconnecting. Deduplication stops double-consumption across network retries. | Requires base revision snapshot. If base snapshot is missing, server authoritative inventory prevails. |
 | **3. Board State / Puzzle Grid** | Highest Level Takes Precedence:<br>Board state from highest completed level wins; if levels are equal, server state prevails. | In casual merge games, merge board grid tiles cannot be field-merged without deterministic move-by-move telemetry. | The secondary device loses uncommitted temporary board tile arrangements from its stale session. |
-| **4. Currency Balances (Coins & Gems)** | Decoupled Server-Authoritative Wallet:<br>Excluded from save payloads. Mutated via dedicated endpoints with row-level locks and OCC. | Completely eliminates client-side currency manipulation, save-overwrite duplication, and double-spending. | Requires network connectivity for store purchases (offline gameplay coin earnings queue as idempotent completion operations). |
+| **4. Currency Balances (Coins & Gems)** | Decoupled Server-Authoritative Wallet:<br>Excluded from save payloads. Mutated via dedicated endpoints with row-level locks and OCC. | Protects against client-side currency tampering, save-overwrite duplication, and double-spending. | Requires network connectivity for store purchases (offline gameplay coin earnings queue as idempotent completion operations). |
 
 ### 3.4 Authoritative Wallet & Append-Only Transaction Log
 
@@ -259,7 +259,7 @@ Currency balances are server-authoritative and managed via `WalletRepository`:
 
 * **Idempotent Purchase Processing:** Store transaction identifiers (`store_transaction_id`) are protected by a unique database constraint. App store retry storms process the first request and return cached receipts for subsequent duplicates.
 * **Catalog Validation:** Incoming product IDs are verified against a registered product catalog. Unknown or tampered product IDs are rejected with `400 Bad Request` (no fallback default currency).
-* **Decoupled Entitlements:** Entitlements reside in `entitlements` (`entitlement_key`, `is_active`, `granted_at`). Permanent purchases (such as No Ads) are linked to purchase transaction records and cannot be revoked by save synchronization.
+* **Decoupled Entitlements:** Entitlements reside in `entitlements` (`entitlement_key`, `is_active`, `granted_at`). Non-consumable purchases (such as No Ads) are linked to purchase transaction records and cannot be revoked by save synchronization.
 * **Production vs. Prototype Verification:** The prototype implements an in-memory catalog verification service. Production deployment requires configuring Google Cloud Service Account credentials for Google Play Developer API and private keys for Apple StoreKit 2 (JWS receipt verification).
 
 ### 3.6 Legacy Client Compatibility & Device Identification (`/legacy/sync`)
@@ -323,17 +323,17 @@ PFP operates on an intentional, player-protective policy assumption: **it assume
    * *Calculation:*
      $\text{Gems} = \min(6200, 0) = 0\text{ gems}$
      $\text{Coins} = 6200 - 0 = 6,200\text{ coins}$
-   * *Outcome:* Retains 100% of gameplay progress as coins. Studio incurs zero unearned gem dilution.
+   * *Outcome:* Retains their full gameplay progress as coins. The studio incurs no unearned gem dilution.
 4. **Dormant Whale (Fully Depleted):**
    * *History:* Bought 20,000 coins historically. Spent all coins prior to v2.5 (`Current = 0`).
    * *Calculation:*
      $\text{Gems} = \min(0, 20000) = 0\text{ gems}$
      $\text{Coins} = 0 - 0 = 0\text{ coins}$
-   * *Outcome:* Paid coins were already consumed for gameplay value in v2.4; player receives zero unearned currency.
+   * *Outcome:* Paid coins were already consumed for gameplay value in v2.4; the player receives no unearned currency.
 
 ### 4.4 Financial Implications & Executive Approval Requirements
 
-* **Policy Assumption (Not Economic Proof):** PFP cannot prove whether remaining coins originated from real money or gameplay. In reality, some players spent purchased coins first. Converting their remaining balance to gems grants them paid value for what were originally gameplay earnings. This is the calculated business cost of ensuring paying players do not lose paid purchasing power.
+* **Policy Assumption (Not Economic Proof):** PFP cannot prove whether remaining coins originated from real money or gameplay. In reality, some players spent purchased coins first. Converting their remaining balance to gems grants them paid value for what were originally gameplay earnings. This is the deliberate business choice of adopting a player-protective policy assumption in the absence of granular spend telemetry.
 * **Proposed 1:1 Peg Ratio:** The 1:1 coin-to-gem conversion ratio modeled above is an initial engineering and product proposal. It requires formal Finance approval and may be adjusted based on the new store price book.
 * **Restricted Purchase Eligibility:** Migration calculations are strictly restricted to verified historical purchases where `purchase_type == "COIN_PACK"`. Gem packs, entitlements, and non-coin items are completely excluded even if containing coin fields. The migration engine relies strictly on recorded quantities (`coins_in_pack`) without guessed price multipliers or invented catalog mappings. Purchases with missing or invalid quantities are flagged in `unresolved_purchases` for Finance review.
 * **Concurrent Migration Safety:** Wrapped in a transaction-safe strategy using the database uniqueness constraint on `MigrationRecord.player_id`. Simultaneous migration requests for the same player resolve idempotently without double-converting balances.
@@ -357,7 +357,7 @@ Player Distribution (Fact 5):
 ```
 
 * **Version Distribution:** 58% on v2.4, 21% on v2.3, 11% on v2.2, 10% on v2.0–2.1.
-* **Android 7 Constraint:** Approximately half of the v2.0–2.1 cohort (~5% of total DAU) are on Android 7 devices that cannot be updated due to minimum OS requirement changes introduced in v2.2.
+* **Android 7 Constraint:** Approximately half of the v2.0–2.1 cohort (~5% of total DAU) are on Android 7 devices that cannot run the newer builds.
 * **Multi-Device Usage:** ~9% of daily players actively use more than one device (typically a phone on the commute and a tablet at home).
 * **Forced-Update Danger:** A previous forced update (v2.1 to v2.2) resulted in an **18% player drop-off**.
 * **Store Review Latency:** App Store and Google Play certification reviews require **3 to 7 days** according to assignment facts.
@@ -365,7 +365,7 @@ Player Distribution (Fact 5):
 ### 5.2 Non-Forced Rollout Architecture
 
 We will **NOT** deploy a blocking forced-update dialog:
-1. **Permanent Dual-Mode Support:** The backend `/legacy/sync` adapter remains active. Android 7 players can play on v2.0–2.4 without progress regression.
+1. **Dual-Mode Adapter:** The backend `/legacy/sync` adapter remains active so Android 7 players can continue playing on v2.0–2.4 without progress regression.
 2. **Voluntary Store Incentive:** Compatible players receive non-blocking in-game announcements highlighting the new store, daily rewards, and content additions, encouraging voluntary updates without churn.
 
 ### 5.3 Illustrative Staged Rollout Timeline
@@ -415,7 +415,7 @@ flowchart LR
 
 #### For Product Management:
 1. **F2P Economy Balancing:** With store items selling exclusively for gems, how will non-paying players acquire boosters? Will level milestones or daily achievements award small quantities of gems?
-2. **Android 7 Sunsetting Roadmap:** Will the studio maintain the `/legacy/sync` adapter permanently, or establish an announced sunset timeline (e.g. 12 months) with account export options?
+2. **Android 7 Sunsetting Roadmap:** Will the studio maintain the `/legacy/sync` adapter indefinitely, or establish an announced sunset timeline (e.g. 12 months) with account export options?
 
 #### For Finance Leadership:
 1. **Coin-to-Gem Peg Approval:** Does Finance formally approve the proposed 1:1 coin-to-gem peg ratio for purchased coins, or does the new gem store price book require a calibration factor?

@@ -28,32 +28,48 @@ async def legacy_sync(
     player_repo = PlayerRepository(session)
     save_repo = SaveRepository(session)
 
-    # Priority 2 Fix: Authenticate / bind device to player_id
+    # 1. Device authentication & secure account-binding strategy for legacy clients:
+    # An absent, empty, or whitespace-only X-Device-Id MUST NOT bypass verification.
+    if not x_device_id or not x_device_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing required header: X-Device-Id. Legacy device authentication is mandatory.",
+        )
+
+    clean_device_id = x_device_id.strip()
     player = await player_repo.get_by_id(payload.player_id, load_devices=True)
 
     if not player:
-        # Initial registration for this legacy player
+        # Initial registration & account binding for newly discovered legacy player
         player = await player_repo.create_player(payload.player_id)
-        if x_device_id:
-            await player_repo.register_device(
-                player_id=payload.player_id,
-                device_id=x_device_id,
-                platform="Android",
-                os_version="Legacy Client",
-                app_version="2.4",
-            )
+        await player_repo.register_device(
+            player_id=payload.player_id,
+            device_id=clean_device_id,
+            platform="Android",
+            os_version="Legacy Client",
+            app_version="2.4",
+        )
     else:
-        # Existing player: if player has registered devices, verify that requesting device is authorized
+        # Existing player account:
         if player.devices:
             registered_device_ids = {d.device_id for d in player.devices}
-            if x_device_id and x_device_id not in registered_device_ids:
+            if clean_device_id not in registered_device_ids:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Unauthorized: Device is not bound to this player account.",
                 )
+        else:
+            # Secure initial binding for existing accounts lacking registered devices
+            # The first authorized legacy call binds clean_device_id to this player profile
+            await player_repo.register_device(
+                player_id=payload.player_id,
+                device_id=clean_device_id,
+                platform="Android",
+                os_version="Legacy Client",
+                app_version="2.4",
+            )
 
-    # Priority 2 Fix: Do NOT grant No Ads based merely on client payload.no_ads flag!
-    # Check if an authoritative active entitlement already exists on the server
+    # 2. Entitlement verification: Never trust client payload.no_ads
     ent_query = await session.execute(
         select(Entitlement).where(
             Entitlement.player_id == payload.player_id,
@@ -63,7 +79,6 @@ async def legacy_sync(
     )
     ent = ent_query.scalar_one_or_none()
 
-    # If not on server, check for verified purchase evidence in purchase_records
     if not ent:
         purchase_evidence = (await session.execute(
             select(PurchaseRecord).where(
@@ -83,10 +98,9 @@ async def legacy_sync(
             session.add(ent)
             await session.flush()
 
-    # Authoritative state is derived purely from trusted server records
     authoritative_no_ads = True if (ent and ent.is_active) else False
 
-    # 3. Retrieve latest server save
+    # 3. Retrieve latest server save & resolve monotonic progression
     current_save = await save_repo.get_latest_save(payload.player_id)
     resolved_level = payload.level
     merged_inventory = payload.inventory
@@ -97,14 +111,13 @@ async def legacy_sync(
         resolved_level = max(current_save.level, payload.level)
         merged_inventory = dict(current_save.inventory)
 
-    # Save to server
     await save_repo.create_or_update_save(
         player_id=payload.player_id,
         revision_id=next_revision,
         level=resolved_level,
         inventory=merged_inventory,
         game_state={},
-        device_id=x_device_id or "legacy_client",
+        device_id=clean_device_id,
         client_saved_at=datetime.fromtimestamp(payload.saved_at, tz=timezone.utc),
     )
 
@@ -122,7 +135,7 @@ async def legacy_sync(
     )
     wallet = wallet_query.scalar_one_or_none()
 
-    # Preserve migrated wallet balances against legacy uploads
+    # Preserve migrated wallet balances against legacy overwrites
     if wallet and not mig_record:
         wallet.coins_balance = max(wallet.coins_balance, payload.coins)
 

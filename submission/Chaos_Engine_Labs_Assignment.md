@@ -152,18 +152,19 @@ Save payloads contain pure gameplay state only:
 * **Conflict Sync (`base_revision < server.revision`):** 
   * `Level = max(Server_Level, Client_Level)`.
   * **Consumable Inventory Reconciliation:** Rather than naive `max()`, the server uses delta reconciliation against `base_save`. If a stale device uploads an old inventory while another device already consumed boosters, **consumed boosters are NOT restored**. If base snapshot is missing, server authoritative inventory prevails.
+  * **Offline Operation Deduplication:** Server records client-generated unique `operation_id` values in `offline_operations` (enforced by a database uniqueness constraint on `idempotency_key`). Replayed or duplicate offline booster consumption requests submitted across multiple devices are safely deduplicated and ignored.
   * Commits under `revision_id = Server_Revision + 1` with status `MERGED`.
 
 ### 3.3 Authoritative Wallet & Append-Only Transaction Log
 * **Concurrency Locking:** Combines PostgreSQL `SELECT ... FOR UPDATE` with Optimistic Concurrency Control (`lock_version`) in `WalletRepository` to eliminate double-spending races.
-* **Append-Only Transaction Log (`currency_transactions`):** Logs every mutation with `balance_before`, `balance_after`, signed delta `amount`, and `idempotency_key`.
+* **Append-Only Transaction Log (`currency_transactions`):** Logs every mutation with `balance_before`, `balance_after`, signed delta `amount`, and `idempotency_key`. Note: This is an append-only player ledger, not a multi-account double-entry accounting ledger.
 
 ### 3.4 In-App Purchases & Entitlements
-* **Verification (`/purchases/verify`):** Validates receipts against catalog, checks unique constraint on `store_transaction_id`, rejects unknown product IDs, and ensures transactions cannot be claimed across different player accounts.
+* **Verification (`/purchases/verify`):** Validates receipts against catalog, checks unique constraint on `store_transaction_id`, rejects unknown product IDs, and ensures transactions cannot be claimed across different player accounts. (In production, this requires connecting StoreKit 2 and Google Play Developer API).
 * **Entitlements:** Stored in `entitlements` table (`entitlement_key`, `is_active`, `granted_at`). Permanent purchases cannot be overwritten by save syncs.
 
 ### 3.5 Legacy Adapter Security (`/legacy/sync`)
-* **Device Authentication:** Checks `X-Device-Id`. Unbound rogue devices attempting to modify another player's save are rejected with 403 Forbidden.
+* **Mandatory Device Authentication:** Requires `X-Device-Id`. Missing headers strictly return `401 Unauthorized`; unknown or unbound devices attempting to access an existing registered account return `403 Forbidden`. Initial account binding securely binds the calling device on the first authorized sync for accounts without registered devices.
 * **No Ads Restoration Evidence:** Does **not** grant No Ads based on client `payload.no_ads`. Entitlements are only restored if trusted purchase records exist.
 * **Post-Migration Protection:** If the player has already migrated to v2.5, legacy coin uploads cannot overwrite the wallet balance.
 
@@ -212,10 +213,12 @@ Because coin spending occurred purely client-side without transaction logging, *
 
 ### 4.4 Financial Implications & Sign-Off Requirements
 * **Policy Assumption (Not Economic Proof):** PFP incorporates an intentional pro-consumer bias: it assumes players spent free gameplay coins before spending purchased coins. In reality, some players spent purchased coins first. Converting their remaining balance to gems grants them paid value for what were originally gameplay earnings. This is the calculated business cost of guaranteeing zero loss.
+* **Historical Purchase Record Extraction:** The server records the exact historical coin quantity (`coins_in_pack`) for each coin purchase (Fact 4). The migration engine relies strictly on recorded quantities without guessed price multipliers or invented catalog mappings. Purchases with missing or invalid quantities are flagged in `unresolved_purchases` for Finance audit rather than guessed.
+* **Concurrent Migration Safety:** Wrapped in a transaction-safe strategy using the database uniqueness constraint on `MigrationRecord.player_id`. Simultaneous migration requests for the same player resolve idempotently without double-converting balances.
 * **Deferred Revenue Liability:** Unspent gems represent balance sheet liabilities under IFRS 15 / ASC 606 until consumed.
 * **Rollback Limitations:** If a player migrates, converts coins to gems, and immediately spends those gems on store items, a naive rollback cannot simply deduct gems without driving the wallet negative. Rollbacks require manual audit reconciliation when converted currency has been consumed.
 * **Required Sign-Offs:**
-  1. *Finance:* Formal approval of PFP and the 1:1 coin-to-gem peg ratio.
+  1. *Finance:* Formal approval of PFP, handling of unrecorded purchase records, and the 1:1 coin-to-gem peg ratio.
   2. *Product:* Decision on whether to grant a one-time 50–100 free gem welcome bonus to F2P players.
 
 ---

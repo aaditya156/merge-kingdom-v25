@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from datetime import datetime, timezone, timedelta
 from httpx import AsyncClient, ASGITransport
 from backend.app.main import app
@@ -7,6 +8,8 @@ from backend.app.models.purchase import PurchaseRecord
 from backend.app.models.wallet import Wallet
 from backend.app.models.entitlement import Entitlement
 from backend.app.models.device import DeviceRegistration
+from backend.app.models.migration import MigrationRecord
+from backend.app.models.ledger import CurrencyTransaction
 from backend.app.models.base import utc_now
 from backend.tests.conftest import TestSessionLocal
 
@@ -80,13 +83,14 @@ async def test_historical_purchase_calculation_excludes_gems_and_no_ads(db_sessi
             .values(coins_balance=5000, gems_balance=0)
         )
 
-        # 1. Historical coin pack: coin_pack_medium (1200 coins)
+        # 1. Historical coin pack: coin_pack_medium (1200 coins recorded)
         coin_rec = PurchaseRecord(
             player_id="p_coin_calc_test",
             store_platform="GOOGLE_PLAY",
             store_transaction_id="gpa_coin_pack_01",
             product_id="coin_pack_medium",
             purchase_type="COIN_PACK",
+            coins_in_pack=1200,
             price_cents=499,
             verification_status="VERIFIED",
             purchased_at=utc_now(),
@@ -366,6 +370,7 @@ async def test_migration_rollback_after_gems_spent_limitation(db_session):
             store_transaction_id="gpa_sr_01",
             product_id="coin_pack_small",
             purchase_type="COIN_PACK",
+            coins_in_pack=500,
             price_cents=99,
             verification_status="VERIFIED",
             purchased_at=utc_now(),
@@ -395,3 +400,253 @@ async def test_migration_rollback_after_gems_spent_limitation(db_session):
         assert bal["coins_balance"] == 0
 
     app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_legacy_device_authentication_and_unauthorized_access(db_session):
+    """Test 9: Legacy device auth - missing header returns 401, rogue device returns 403, initial binding works."""
+    app.dependency_overrides[get_db] = app_db_override
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Missing X-Device-Id header returns 401 Unauthorized
+        res_no_header = await client.post(
+            "/api/v1/legacy/sync",
+            json={
+                "player_id": "p_leg_auth_1",
+                "saved_at": int(utc_now().timestamp()),
+                "level": 5,
+                "coins": 100,
+                "inventory": {},
+                "no_ads": False,
+            },
+        )
+        assert res_no_header.status_code == 401
+        assert "X-Device-Id" in res_no_header.json()["detail"]
+
+        # 2. Initial binding: New player syncs with valid X-Device-Id -> 200 and binds device
+        res_bind = await client.post(
+            "/api/v1/legacy/sync",
+            headers={"X-Device-Id": "device_leg_owner"},
+            json={
+                "player_id": "p_leg_auth_1",
+                "saved_at": int(utc_now().timestamp()),
+                "level": 5,
+                "coins": 100,
+                "inventory": {},
+                "no_ads": False,
+            },
+        )
+        assert res_bind.status_code == 200
+
+        # 3. Attempting to access p_leg_auth_1 from an unknown/unbound device returns 403 Forbidden
+        res_rogue = await client.post(
+            "/api/v1/legacy/sync",
+            headers={"X-Device-Id": "device_leg_attacker"},
+            json={
+                "player_id": "p_leg_auth_1",
+                "saved_at": int(utc_now().timestamp()),
+                "level": 99,
+                "coins": 0,
+                "inventory": {},
+                "no_ads": False,
+            },
+        )
+        assert res_rogue.status_code == 403
+        assert "not bound" in res_rogue.json()["detail"]
+
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_historical_purchase_missing_and_invalid_records_not_invented(db_session):
+    """Test 10: Missing/invalid historical purchase quantities are flagged, not guessed or multiplied."""
+    app.dependency_overrides[get_db] = app_db_override
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login = await client.post(
+            "/api/v1/auth/device-login",
+            json={"player_id": "p_invalid_purch_test", "device_id": "dev_inv_p", "platform": "Android", "app_version": "2.4", "os_version": "Android 11"},
+        )
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Wallet has 2000 coins
+        await db_session.execute(
+            Wallet.__table__.update()
+            .where(Wallet.player_id == "p_invalid_purch_test")
+            .values(coins_balance=2000, gems_balance=0)
+        )
+
+        # Purchase 1: Valid recorded coins (500 coins)
+        p1 = PurchaseRecord(
+            player_id="p_invalid_purch_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_valid_500",
+            product_id="custom_coin_pack_500",
+            purchase_type="COIN_PACK",
+            coins_in_pack=500,
+            price_cents=499,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        # Purchase 2: Missing coin quantity (coins_in_pack=None, raw_receipt=None)
+        p2 = PurchaseRecord(
+            player_id="p_invalid_purch_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_missing_qty",
+            product_id="unrecorded_pack_mystery",
+            purchase_type="COIN_PACK",
+            coins_in_pack=None,
+            price_cents=999,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        # Purchase 3: Invalid corrupted coin quantity (negative coins)
+        p3 = PurchaseRecord(
+            player_id="p_invalid_purch_test",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_corrupt_negative",
+            product_id="bad_pack_negative",
+            purchase_type="COIN_PACK",
+            coins_in_pack=-1000,
+            price_cents=999,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        db_session.add_all([p1, p2, p3])
+        await db_session.commit()
+
+        # Execute migration
+        res = await client.post("/api/v1/migration/migrate", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+
+        # Lifetime purchased coins must strictly be 500 (from p1).
+        # It must NOT invent 999*10 for p2 or guess negative values for p3!
+        assert data["lifetime_purchased_coins"] == 500
+        assert data["converted_gems"] == 500
+        assert data["converted_coins"] == 1500
+
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_same_offline_inventory_operation_submitted_repeatedly_from_two_devices(db_session):
+    """Test 11: Deduplication ensures the same offline consumption operation cannot be applied twice across devices."""
+    app.dependency_overrides[get_db] = app_db_override
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login = await client.post(
+            "/api/v1/auth/device-login",
+            json={"player_id": "p_dedup_test", "device_id": "phone_alpha", "platform": "Android", "app_version": "2.5.0", "os_version": "Android 14"},
+        )
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Initialize save with 5 hammers
+        init_save = await client.post(
+            "/api/v1/saves/sync",
+            headers=headers,
+            json={
+                "base_revision_id": 0,
+                "level": 10,
+                "inventory": {"hammer": 5, "shuffle": 2},
+                "game_state": {},
+                "client_saved_at": utc_now().isoformat(),
+                "device_id": "phone_alpha",
+            },
+        )
+        assert init_save.status_code == 200
+        assert init_save.json()["inventory"]["hammer"] == 5
+
+        # Device 1 submits offline consumption operation op_hammer_unique_99 (consumes 1 hammer)
+        op_payload = {
+            "operation_id": "op_hammer_unique_99",
+            "item_id": "hammer",
+            "quantity": 1,
+            "device_id": "phone_alpha",
+        }
+        res_device_1 = await client.post("/api/v1/saves/operations/consume", headers=headers, json=op_payload)
+        assert res_device_1.status_code == 200
+        data1 = res_device_1.json()
+        assert data1["status"] == "APPLIED"
+        assert data1["inventory"]["hammer"] == 4
+
+        # Device 2 (e.g. tablet) syncs and re-submits the exact same operation_id op_hammer_unique_99
+        op_payload_dup = {
+            "operation_id": "op_hammer_unique_99",
+            "item_id": "hammer",
+            "quantity": 1,
+            "device_id": "tablet_beta",
+        }
+        res_device_2 = await client.post("/api/v1/saves/operations/consume", headers=headers, json=op_payload_dup)
+        assert res_device_2.status_code == 200
+        data2 = res_device_2.json()
+        # Deduplicated! Must be ignored and NOT deduct another hammer!
+        assert data2["status"] == "DUPLICATE_IGNORED"
+        assert data2["inventory"]["hammer"] == 4
+
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_simultaneous_migration_requests(db_session):
+    """Test 12: Two simultaneous migration requests cannot double-convert the balance."""
+    app.dependency_overrides[get_db] = app_db_override
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login = await client.post(
+            "/api/v1/auth/device-login",
+            json={"player_id": "p_concurrent_mig", "device_id": "dev_cm_1", "platform": "Android", "app_version": "2.4", "os_version": "Android 11"},
+        )
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Wallet has 3000 coins
+        await db_session.execute(
+            Wallet.__table__.update()
+            .where(Wallet.player_id == "p_concurrent_mig")
+            .values(coins_balance=3000, gems_balance=0)
+        )
+        # Purchase record for 1000 coins
+        rec = PurchaseRecord(
+            player_id="p_concurrent_mig",
+            store_platform="GOOGLE_PLAY",
+            store_transaction_id="gpa_cm_rec_01",
+            product_id="coin_pack_1000",
+            purchase_type="COIN_PACK",
+            coins_in_pack=1000,
+            price_cents=999,
+            verification_status="VERIFIED",
+            purchased_at=utc_now(),
+        )
+        db_session.add(rec)
+        await db_session.commit()
+
+        # Fire two migration requests simultaneously
+        req1 = client.post("/api/v1/migration/migrate", headers=headers)
+        req2 = client.post("/api/v1/migration/migrate", headers=headers)
+
+        res1, res2 = await asyncio.gather(req1, req2)
+
+        assert res1.status_code == 200
+        assert res2.status_code == 200
+
+        # Both responses must agree on the converted numbers
+        assert res1.json()["converted_gems"] == 1000
+        assert res2.json()["converted_gems"] == 1000
+        assert res1.json()["converted_coins"] == 2000
+        assert res2.json()["converted_coins"] == 2000
+
+        # Verify wallet balance in DB: must be strictly 1000 gems and 2000 coins (NOT double credited!)
+        bal_res = await client.get("/api/v1/wallet/balance", headers=headers)
+        bal = bal_res.json()
+        assert bal["gems_balance"] == 1000
+        assert bal["coins_balance"] == 2000
+
+    app.dependency_overrides.clear()
+
